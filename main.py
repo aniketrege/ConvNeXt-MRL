@@ -25,12 +25,14 @@ from timm.utils import ModelEma
 from optim_factory import create_optimizer, LayerDecayValueAssigner
 
 from datasets import build_dataset
-from engine import train_one_epoch, evaluate
+from engine import train_one_epoch, evaluate, evaluate_mrl
 
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
 import models.convnext
 import models.convnext_isotropic
+
+from MRL import *
 
 def str2bool(v):
     """
@@ -306,6 +308,8 @@ def main(args):
                 print(f"Removing key {k} from pretrained checkpoint")
                 del checkpoint_model[k]
         utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
+        
+    model.head = MRL_Linear_Layer([12, 24, 48, 96, 192, 384, 768], num_classes=1000, efficient=False)
     model.to(device)
 
     model_ema = None
@@ -317,7 +321,7 @@ def main(args):
             device='cpu' if args.model_ema_force_cpu else '',
             resume='')
         print("Using EMA with decay = %.8f" % args.model_ema_decay)
-
+    
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -368,7 +372,7 @@ def main(args):
 
     if mixup_fn is not None:
         # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
+        criterion = Matryoshka_STCE_Loss()
     elif args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
@@ -382,8 +386,9 @@ def main(args):
 
     if args.eval:
         print(f"Eval only mode")
-        test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
-        print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
+        #test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
+        test_stats = evaluate_mrl(data_loader_val, model, device, [12, 24, 48, 96, 192, 384, 768], args.output_dir, str(lr_schedule_values[-1]), epoch=1, use_amp=args.use_amp)
+        #print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
         return
 
     max_accuracy = 0.0
@@ -413,53 +418,56 @@ def main(args):
                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
         if data_loader_val is not None:
-            test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
-            print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-            if max_accuracy < test_stats["acc1"]:
-                max_accuracy = test_stats["acc1"]
-                if args.output_dir and args.save_ckpt:
-                    utils.save_model(
+            test_stats = evaluate_mrl(data_loader_val, model, device, [12, 24, 48, 96, 192, 384, 768], args.output_dir, str(lr_schedule_values[-1]), epoch, use_amp=args.use_amp)
+            utils.save_model(
                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                        loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
-            print(f'Max accuracy: {max_accuracy:.2f}%')
+                        loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
+#             print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['top_1_768']:.1f}%")
+#             if max_accuracy < test_stats["top_1_768"]:
+#                 max_accuracy = test_stats["top_1_768"]
+#                 if args.output_dir and args.save_ckpt:
+#                     utils.save_model(
+#                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+#                         loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
+#             print(f'Max accuracy: {max_accuracy:.2f}%')
 
-            if log_writer is not None:
-                log_writer.update(test_acc1=test_stats['acc1'], head="perf", step=epoch)
-                log_writer.update(test_acc5=test_stats['acc5'], head="perf", step=epoch)
-                log_writer.update(test_loss=test_stats['loss'], head="perf", step=epoch)
+#             if log_writer is not None:
+#                 log_writer.update(test_acc1=test_stats['top_1_768'], head="perf", step=epoch)
+#                 log_writer.update(test_acc5=test_stats['top_5_768'], head="perf", step=epoch)
+#                 log_writer.update(test_loss=test_stats['loss'], head="perf", step=epoch)
 
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         **{f'test_{k}': v for k, v in test_stats.items()},
-                         'epoch': epoch,
-                         'n_parameters': n_parameters}
+#             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+#                          **{f'test_{k}': v for k, v in test_stats.items()},
+#                          'epoch': epoch,
+#                          'n_parameters': n_parameters}
 
-            # repeat testing routines for EMA, if ema eval is turned on
-            if args.model_ema and args.model_ema_eval:
-                test_stats_ema = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp)
-                print(f"Accuracy of the model EMA on {len(dataset_val)} test images: {test_stats_ema['acc1']:.1f}%")
-                if max_accuracy_ema < test_stats_ema["acc1"]:
-                    max_accuracy_ema = test_stats_ema["acc1"]
-                    if args.output_dir and args.save_ckpt:
-                        utils.save_model(
-                            args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                            loss_scaler=loss_scaler, epoch="best-ema", model_ema=model_ema)
-                    print(f'Max EMA accuracy: {max_accuracy_ema:.2f}%')
-                if log_writer is not None:
-                    log_writer.update(test_acc1_ema=test_stats_ema['acc1'], head="perf", step=epoch)
-                log_stats.update({**{f'test_{k}_ema': v for k, v in test_stats_ema.items()}})
-        else:
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                         'epoch': epoch,
-                         'n_parameters': n_parameters}
+#             # repeat testing routines for EMA, if ema eval is turned on
+#             if args.model_ema and args.model_ema_eval:
+#                 test_stats_ema = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp)
+#                 print(f"Accuracy of the model EMA on {len(dataset_val)} test images: {test_stats_ema['acc1']:.1f}%")
+#                 if max_accuracy_ema < test_stats_ema["acc1"]:
+#                     max_accuracy_ema = test_stats_ema["acc1"]
+#                     if args.output_dir and args.save_ckpt:
+#                         utils.save_model(
+#                             args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+#                             loss_scaler=loss_scaler, epoch="best-ema", model_ema=model_ema)
+#                     print(f'Max EMA accuracy: {max_accuracy_ema:.2f}%')
+#                 if log_writer is not None:
+#                     log_writer.update(test_acc1_ema=test_stats_ema['acc1'], head="perf", step=epoch)
+#                 log_stats.update({**{f'test_{k}_ema': v for k, v in test_stats_ema.items()}})
+#         else:
+#             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+#                          'epoch': epoch,
+#                          'n_parameters': n_parameters}
 
-        if args.output_dir and utils.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
+#         if args.output_dir and utils.is_main_process():
+#             if log_writer is not None:
+#                 log_writer.flush()
+#             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+#                 f.write(json.dumps(log_stats) + "\n")
 
-        if wandb_logger:
-            wandb_logger.log_epoch_metrics(log_stats)
+#         if wandb_logger:
+#             wandb_logger.log_epoch_metrics(log_stats)
 
     if wandb_logger and args.wandb_ckpt and args.save_ckpt and args.output_dir:
         wandb_logger.log_checkpoints()

@@ -5,12 +5,16 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-
+import json
 import math
+from MRL import Matryoshka_STCE_Loss
 from typing import Iterable, Optional
 import torch
+import torchmetrics
+import time
 from timm.data import Mixup
 from timm.utils import accuracy, ModelEma
+from tqdm import tqdm
 
 import utils
 
@@ -28,7 +32,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     print_freq = 10
 
     optimizer.zero_grad()
-
+    losses = []
+    
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
@@ -55,8 +60,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         else: # full precision
             output = model(samples)
             loss = criterion(output, targets)
-
-        loss_value = loss.item()
+            
+        losses.append(loss.detach())
+        loss_value = torch.stack(losses).mean().cpu().item()
 
         if not math.isfinite(loss_value): # this could trigger if using AMP
             print("Loss is {}, stopping training".format(loss_value))
@@ -134,6 +140,65 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+def log(content, log_folder):
+        print(f'=> Log: {content}')
+        cur_time = time.time()
+        with open(log_folder + 'log', 'a+') as fd:
+            fd.write(json.dumps({
+                'timestamp': cur_time,
+                **content
+            }) + '\n')
+            fd.flush()
+            
+def mrl_metric_logger(nesting_list, gpu):
+    val_meters={}
+    for i in nesting_list:
+        val_meters['top_1_{}'.format(i)] = torchmetrics.Accuracy(compute_on_step=False).to(gpu)
+
+    for i in nesting_list:
+        val_meters['top_5_{}'.format(i)] = torchmetrics.Accuracy(compute_on_step=False, top_k=5).to(gpu)
+
+    val_meters['loss'] = MeanScalarMetric(compute_on_step=False).to(gpu)
+    
+    return val_meters
+    
+@torch.no_grad()
+def evaluate_mrl(data_loader, model, device, nesting_list, output_dir, lr, epoch, use_amp=False):
+    model.eval()
+    criterion = Matryoshka_STCE_Loss()
+    val_meters = mrl_metric_logger(nesting_list, device)
+    
+    for images, target in tqdm(data_loader):
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                output = model(images)
+        else:
+            output = model(images)
+        output=torch.stack(output, dim=0)
+        
+        # Logging the accuracies top1/5 for each of nesting...
+        for i in range(len(nesting_list)):
+            s = "top_1_{}".format(nesting_list[i])
+            val_meters[s](output[i], target)
+            s = "top_5_{}".format(nesting_list[i])
+            val_meters[s](output[i], target)
+            
+#         loss = criterion(output, target)
+#         val_meters['loss'](loss)
+        
+    stats = {k: m.compute().item() for k, m in val_meters.items()}
+    [meter.reset() for meter in val_meters.values()]
+    
+    d = {'current_lr': lr, 'epoch': epoch}
+    for k in stats.keys():
+        d[k]=stats[k]
+    log(dict(d), output_dir)
+    
+    return stats
+        
 @torch.no_grad()
 def evaluate(data_loader, model, device, use_amp=False):
     criterion = torch.nn.CrossEntropyLoss()
@@ -158,7 +223,8 @@ def evaluate(data_loader, model, device, use_amp=False):
         else:
             output = model(images)
             loss = criterion(output, target)
-
+            
+        output=torch.stack(output, dim=0)
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
         batch_size = images.shape[0]
@@ -171,3 +237,17 @@ def evaluate(data_loader, model, device, use_amp=False):
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+class MeanScalarMetric(torchmetrics.Metric):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.add_state('sum', default=torch.tensor(0.), dist_reduce_fx='sum')
+        self.add_state('count', default=torch.tensor(0), dist_reduce_fx='sum')
+
+    def update(self, sample: torch.Tensor):
+        self.sum += sample.sum()
+        self.count += sample.numel()
+
+    def compute(self):
+        return self.sum.float() / self.count
